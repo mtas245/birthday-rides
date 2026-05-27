@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from "react";
 import { useJsApiLoader, Autocomplete } from "@react-google-maps/api";
-
 import {
   collection,
   addDoc,
@@ -11,7 +10,6 @@ import {
   updateDoc,
   onSnapshot,
 } from "firebase/firestore";
-
 import { db } from "@/lib/firebase";
 
 const PARTY_LOCATION = "Klostergut Fremersberg, 76530 Baden-Baden";
@@ -27,49 +25,43 @@ function getTotalSeats(guests = []) {
   return guests.reduce((total, guest) => total + (guest.personCount || 1), 0);
 }
 
-function calculateDistanceKm(locationA, locationB) {
-  if (!locationA || !locationB) return Infinity;
+function getStatusText(status) {
+  if (status === "open") return "Wartet auf Fahrer";
+  if (status === "assigned") return "Fahrer ist unterwegs";
+  if (status === "done") return "Fahrt erledigt";
+  if (status === "cancelled") return "Fahrt storniert";
+  return "Unbekannt";
+}
 
-  const earthRadiusKm = 6371;
-  const dLat = ((locationB.lat - locationA.lat) * Math.PI) / 180;
-  const dLng = ((locationB.lng - locationA.lng) * Math.PI) / 180;
-  const lat1 = (locationA.lat * Math.PI) / 180;
-  const lat2 = (locationB.lat * Math.PI) / 180;
-
-  const a =
+function calculateDistanceKm(a, b) {
+  if (!a || !b) return Infinity;
+  const R = 6371;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+  const lat1 = (a.lat * Math.PI) / 180;
+  const lat2 = (b.lat * Math.PI) / 180;
+  const x =
     Math.sin(dLat / 2) ** 2 +
     Math.sin(dLng / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-  return earthRadiusKm * c;
+  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 
 function getAverageLocation(guests) {
-  const guestsWithLocation = guests.filter((guest) => guest.location);
+  const list = guests.filter((g) => g.location);
+  if (!list.length) return null;
 
-  if (guestsWithLocation.length === 0) return null;
-
-  const total = guestsWithLocation.reduce(
-    (sum, guest) => ({
-      lat: sum.lat + guest.location.lat,
-      lng: sum.lng + guest.location.lng,
+  const total = list.reduce(
+    (sum, g) => ({
+      lat: sum.lat + g.location.lat,
+      lng: sum.lng + g.location.lng,
     }),
     { lat: 0, lng: 0 }
   );
 
   return {
-    lat: total.lat / guestsWithLocation.length,
-    lng: total.lng / guestsWithLocation.length,
+    lat: total.lat / list.length,
+    lng: total.lng / list.length,
   };
-}
-
-function getStatusText(status) {
-  if (status === "open") return "Wartet auf Fahrer";
-  if (status === "assigned") return "Fahrer ist unterwegs";
-  if (status === "done") return "Fahrt erledigt";
-
-  return "Unbekannt";
 }
 
 export default function GastPage() {
@@ -78,12 +70,13 @@ export default function GastPage() {
   const [address, setAddress] = useState("");
   const [guestLocation, setGuestLocation] = useState(null);
 
-  const [result, setResult] = useState(null);
+  const [autocomplete, setAutocomplete] = useState(null);
   const [liveRide, setLiveRide] = useState(null);
   const [driverLocation, setDriverLocation] = useState(null);
   const [liveEtaMinutes, setLiveEtaMinutes] = useState(null);
 
-  const [autocomplete, setAutocomplete] = useState(null);
+  const [searchRideNumber, setSearchRideNumber] = useState("");
+  const [searchName, setSearchName] = useState("");
 
   const { isLoaded } = useJsApiLoader({
     googleMapsApiKey: GOOGLE_MAPS_API_KEY,
@@ -92,16 +85,10 @@ export default function GastPage() {
 
   useEffect(() => {
     const savedRideId = localStorage.getItem("guestRideId");
-
     if (!savedRideId) return;
 
-    const unsubscribe = onSnapshot(doc(db, "rides", savedRideId), (snapshot) => {
-      if (snapshot.exists()) {
-        setLiveRide({
-          id: snapshot.id,
-          ...snapshot.data(),
-        });
-      }
+    const unsubscribe = onSnapshot(doc(db, "rides", savedRideId), (snap) => {
+      if (snap.exists()) setLiveRide({ id: snap.id, ...snap.data() });
     });
 
     return () => unsubscribe();
@@ -112,75 +99,30 @@ export default function GastPage() {
 
     const unsubscribe = onSnapshot(
       doc(db, "drivers", liveRide.assignedDriver),
-      (snapshot) => {
-        if (snapshot.exists()) {
-          const driverData = snapshot.data();
-          setDriverLocation(driverData.location || null);
-        }
+      (snap) => {
+        if (snap.exists()) setDriverLocation(snap.data().location || null);
       }
     );
 
     return () => unsubscribe();
   }, [liveRide?.assignedDriver]);
 
-  async function calculateDrivingMinutes(destinationAddress) {
+  async function calculateDrivingMinutes(origin, destination) {
     return new Promise((resolve, reject) => {
       const service = new window.google.maps.DistanceMatrixService();
 
       service.getDistanceMatrix(
         {
-          origins: [PARTY_LOCATION],
-          destinations: [destinationAddress],
+          origins: [origin],
+          destinations: [destination],
           travelMode: window.google.maps.TravelMode.DRIVING,
           unitSystem: window.google.maps.UnitSystem.METRIC,
         },
         (response, status) => {
-          if (status !== "OK") {
-            reject(status);
-            return;
-          }
+          if (status !== "OK") return reject(status);
 
           const element = response.rows[0].elements[0];
-
-          if (element.status !== "OK") {
-            reject(element.status);
-            return;
-          }
-
-          resolve(Math.ceil(element.duration.value / 60));
-        }
-      );
-    });
-  }
-
-  async function calculateLiveEtaMinutes(driverLocation, destinationLocation) {
-    return new Promise((resolve, reject) => {
-      if (!driverLocation || !destinationLocation) {
-        resolve(null);
-        return;
-      }
-
-      const service = new window.google.maps.DistanceMatrixService();
-
-      service.getDistanceMatrix(
-        {
-          origins: [driverLocation],
-          destinations: [destinationLocation],
-          travelMode: window.google.maps.TravelMode.DRIVING,
-          unitSystem: window.google.maps.UnitSystem.METRIC,
-        },
-        (response, status) => {
-          if (status !== "OK") {
-            reject(status);
-            return;
-          }
-
-          const element = response.rows[0].elements[0];
-
-          if (element.status !== "OK") {
-            reject(element.status);
-            return;
-          }
+          if (element.status !== "OK") return reject(element.status);
 
           resolve(Math.ceil(element.duration.value / 60));
         }
@@ -189,29 +131,22 @@ export default function GastPage() {
   }
 
   useEffect(() => {
-    async function updateLiveEta() {
-      if (!liveRide || !driverLocation) return;
+    async function updateEta() {
+      if (!liveRide || !driverLocation || liveRide.status !== "assigned") return;
 
       const firstGuest = liveRide.guests?.[0];
-
       if (!firstGuest?.location) return;
 
       try {
-        const eta = await calculateLiveEtaMinutes(
-          driverLocation,
-          firstGuest.location
-        );
-
+        const eta = await calculateDrivingMinutes(driverLocation, firstGuest.location);
         setLiveEtaMinutes(eta);
       } catch (error) {
-        console.error("Live ETA Fehler:", error);
+        console.error(error);
       }
     }
 
-    updateLiveEta();
-
-    const interval = setInterval(updateLiveEta, 15000);
-
+    updateEta();
+    const interval = setInterval(updateEta, 15000);
     return () => clearInterval(interval);
   }, [liveRide, driverLocation]);
 
@@ -221,15 +156,12 @@ export default function GastPage() {
 
     openRides.forEach((ride) => {
       const guests = Array.isArray(ride.guests) ? ride.guests : [];
-      const currentSeats = getTotalSeats(guests);
+      if (getTotalSeats(guests) + newPersonCount > MAX_SEATS_PER_RIDE) return;
 
-      if (currentSeats + newPersonCount > MAX_SEATS_PER_RIDE) {
-        return;
-      }
-
-      const averageLocation = getAverageLocation(guests);
-
-      const distance = calculateDistanceKm(newGuestLocation, averageLocation);
+      const distance = calculateDistanceKm(
+        newGuestLocation,
+        getAverageLocation(guests)
+      );
 
       if (distance < shortestDistance && distance <= MAX_DISTANCE_KM) {
         shortestDistance = distance;
@@ -245,32 +177,15 @@ export default function GastPage() {
 
     const numericPersonCount = Number(personCount);
 
-    if (!name || !address) {
-      alert("Bitte Name und Adresse eingeben.");
-      return;
-    }
-
-    if (
-      !numericPersonCount ||
-      numericPersonCount < 1 ||
-      numericPersonCount > 4
-    ) {
-      alert("Bitte eine Personenanzahl zwischen 1 und 4 eingeben.");
-      return;
-    }
-
-    if (!guestLocation) {
-      alert("Bitte Adresse aus Google-Vorschlägen wählen.");
-      return;
+    if (!name || !address) return alert("Bitte Name und Adresse eingeben.");
+    if (!guestLocation) return alert("Bitte Adresse aus Google-Vorschlägen wählen.");
+    if (numericPersonCount < 1 || numericPersonCount > 4) {
+      return alert("Personenzahl muss zwischen 1 und 4 sein.");
     }
 
     try {
-      const ridesSnapshot = await getDocs(collection(db, "rides"));
-
-      const rides = ridesSnapshot.docs.map((docItem) => ({
-        id: docItem.id,
-        ...docItem.data(),
-      }));
+      const snap = await getDocs(collection(db, "rides"));
+      const rides = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
       const openRides = rides.filter(
         (ride) =>
@@ -279,9 +194,11 @@ export default function GastPage() {
           getTotalSeats(ride.guests) < MAX_SEATS_PER_RIDE
       );
 
-      const oneWayMinutes = await calculateDrivingMinutes(address);
+      const oneWayMinutes = await calculateDrivingMinutes(PARTY_LOCATION, address);
+      const guestId = crypto.randomUUID();
 
       const newGuest = {
+        id: guestId,
         name,
         personCount: numericPersonCount,
         address,
@@ -294,30 +211,25 @@ export default function GastPage() {
 
       if (assignedRide) {
         const updatedGuests = [...assignedRide.guests, newGuest];
-
         const maxOneWayMinutes = Math.max(
-          ...updatedGuests.map((guest) => guest.oneWayMinutes || 10)
+          ...updatedGuests.map((g) => g.oneWayMinutes || 10)
         );
-
-        const estimatedRideMinutes = maxOneWayMinutes * 2 + BUFFER_MINUTES;
 
         await updateDoc(doc(db, "rides", assignedRide.id), {
           guests: updatedGuests,
           totalSeats: getTotalSeats(updatedGuests),
-          estimatedRideMinutes,
           oneWayMinutes: maxOneWayMinutes,
+          estimatedRideMinutes: maxOneWayMinutes * 2 + BUFFER_MINUTES,
         });
 
         assignedRide = {
           ...assignedRide,
           guests: updatedGuests,
           totalSeats: getTotalSeats(updatedGuests),
-          estimatedRideMinutes,
+          estimatedRideMinutes: maxOneWayMinutes * 2 + BUFFER_MINUTES,
         };
       } else {
-        const nextRideNumber = rides.length + 1;
-        const rideNumber = `Fahrt-${String(nextRideNumber).padStart(3, "0")}`;
-
+        const rideNumber = `Fahrt-${String(rides.length + 1).padStart(3, "0")}`;
         const estimatedRideMinutes = oneWayMinutes * 2 + BUFFER_MINUTES;
 
         const newRide = {
@@ -332,38 +244,34 @@ export default function GastPage() {
           createdAt: Date.now(),
         };
 
-        const newRideRef = await addDoc(collection(db, "rides"), newRide);
-
-        assignedRide = {
-          id: newRideRef.id,
-          ...newRide,
-        };
+        const ref = await addDoc(collection(db, "rides"), newRide);
+        assignedRide = { id: ref.id, ...newRide };
       }
 
       const activeRides = rides.filter(
         (ride) => ride.status === "open" || ride.status === "assigned"
       );
 
-      const totalQueueMinutes = activeRides.reduce((total, ride) => {
-        return total + (ride.estimatedRideMinutes || 20);
-      }, 0);
-
-      const queueMinutes = Math.ceil(totalQueueMinutes / ACTIVE_DRIVER_COUNT);
+      const totalQueueMinutes = activeRides.reduce(
+        (total, ride) => total + (ride.estimatedRideMinutes || 20),
+        0
+      );
 
       const estimatedWaitingMinutes =
-        queueMinutes + (assignedRide.estimatedRideMinutes || 20);
+        Math.ceil(totalQueueMinutes / ACTIVE_DRIVER_COUNT) +
+        (assignedRide.estimatedRideMinutes || 20);
 
       await updateDoc(doc(db, "rides", assignedRide.id), {
         estimatedWaitingMinutes,
       });
 
       localStorage.setItem("guestRideId", assignedRide.id);
+      localStorage.setItem("guestId", guestId);
+      localStorage.setItem("guestName", name);
 
-      setResult({
-        rideNumber: assignedRide.rideNumber,
+      setLiveRide({
+        ...assignedRide,
         estimatedWaitingMinutes,
-        oneWayMinutes,
-        totalSeats: getTotalSeats(assignedRide.guests),
       });
 
       setName("");
@@ -372,15 +280,71 @@ export default function GastPage() {
       setGuestLocation(null);
     } catch (error) {
       console.error(error);
-
       alert("Fehler bei Berechnung oder Speicherung.");
     }
+  }
+
+  async function searchRide(e) {
+    e.preventDefault();
+
+    if (!searchRideNumber) return alert("Bitte Fahrtnummer eingeben.");
+
+    const snap = await getDocs(collection(db, "rides"));
+    const rides = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    const foundRide = rides.find(
+      (ride) =>
+        ride.rideNumber.toLowerCase() === searchRideNumber.trim().toLowerCase()
+    );
+
+    if (!foundRide) return alert("Keine Fahrt gefunden.");
+
+    localStorage.setItem("guestRideId", foundRide.id);
+    if (searchName) localStorage.setItem("guestName", searchName);
+
+    setLiveRide(foundRide);
+  }
+
+  async function cancelRide() {
+    if (!liveRide) return;
+
+    const guestId = localStorage.getItem("guestId");
+    const guestName = localStorage.getItem("guestName") || searchName;
+
+    const currentGuests = Array.isArray(liveRide.guests) ? liveRide.guests : [];
+
+    const updatedGuests = currentGuests.filter((guest) => {
+      if (guestId && guest.id) return guest.id !== guestId;
+      if (guestName) return guest.name.toLowerCase() !== guestName.toLowerCase();
+      return true;
+    });
+
+    if (updatedGuests.length === currentGuests.length) {
+      return alert("Gast konnte nicht eindeutig gefunden werden. Bitte mit Name suchen.");
+    }
+
+    const newTotalSeats = getTotalSeats(updatedGuests);
+
+    await updateDoc(doc(db, "rides", liveRide.id), {
+      guests: updatedGuests,
+      totalSeats: newTotalSeats,
+      status: updatedGuests.length === 0 ? "cancelled" : liveRide.status,
+    });
+
+    localStorage.removeItem("guestRideId");
+    localStorage.removeItem("guestId");
+    localStorage.removeItem("guestName");
+
+    setLiveRide(null);
+    setLiveEtaMinutes(null);
+
+    alert("Deine Anmeldung wurde storniert.");
   }
 
   if (!isLoaded) {
     return (
       <main className="min-h-screen flex items-center justify-center">
-        <p>Lade Google Maps...</p>
+        Lade Google Maps...
       </main>
     );
   }
@@ -391,18 +355,9 @@ export default function GastPage() {
         <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md space-y-4">
           <h1 className="text-3xl font-bold">Dein Fahrstatus</h1>
 
-          <p>
-            Fahrt: <strong>{liveRide.rideNumber}</strong>
-          </p>
-
-          <p>
-            Status: <strong>{getStatusText(liveRide.status)}</strong>
-          </p>
-
-          <p>
-            Fahrer:{" "}
-            <strong>{liveRide.assignedDriver || "Noch nicht zugeteilt"}</strong>
-          </p>
+          <p>Fahrt: <strong>{liveRide.rideNumber}</strong></p>
+          <p>Status: <strong>{getStatusText(liveRide.status)}</strong></p>
+          <p>Fahrer: <strong>{liveRide.assignedDriver || "Noch nicht zugeteilt"}</strong></p>
 
           {liveRide.status === "assigned" && (
             <p>
@@ -417,30 +372,32 @@ export default function GastPage() {
 
           <p>
             Personen in der Fahrt:{" "}
-            <strong>
-              {liveRide.totalSeats || getTotalSeats(liveRide.guests)}
-            </strong>{" "}
-            / {MAX_SEATS_PER_RIDE}
+            <strong>{liveRide.totalSeats || getTotalSeats(liveRide.guests)}</strong> /{" "}
+            {MAX_SEATS_PER_RIDE}
           </p>
 
           <p>
             Geschätzte Wartezeit: ca.{" "}
-            <strong>
-              {liveRide.estimatedWaitingMinutes || "?"} Minuten
-            </strong>
+            <strong>{liveRide.estimatedWaitingMinutes || "?"} Minuten</strong>
           </p>
+
+          <button
+            className="w-full bg-red-600 text-white p-3 rounded-xl"
+            onClick={cancelRide}
+          >
+            Fahrt stornieren
+          </button>
 
           <button
             className="w-full bg-gray-200 text-black p-3 rounded-xl"
             onClick={() => {
               localStorage.removeItem("guestRideId");
+              localStorage.removeItem("guestId");
+              localStorage.removeItem("guestName");
               setLiveRide(null);
-              setResult(null);
-              setDriverLocation(null);
-              setLiveEtaMinutes(null);
             }}
           >
-            Neue Fahrt anmelden
+            Andere Fahrt suchen / neu anmelden
           </button>
         </div>
       </main>
@@ -449,10 +406,10 @@ export default function GastPage() {
 
   return (
     <main className="min-h-screen flex items-center justify-center bg-gray-100 p-6 text-black">
-      <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md">
-        <h1 className="text-3xl font-bold mb-6">Geburtstagsfahrten</h1>
+      <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md space-y-8">
+        <div>
+          <h1 className="text-3xl font-bold mb-6">Geburtstagsfahrten</h1>
 
-        {!result ? (
           <form onSubmit={handleSubmit} className="space-y-4">
             <input
               type="text"
@@ -478,7 +435,6 @@ export default function GastPage() {
               onPlaceChanged={() => {
                 if (autocomplete) {
                   const place = autocomplete.getPlace();
-
                   setAddress(place.formatted_address || "");
 
                   if (place.geometry) {
@@ -497,36 +453,37 @@ export default function GastPage() {
               />
             </Autocomplete>
 
-            <button
-              type="submit"
-              className="w-full bg-black text-white p-3 rounded-xl"
-            >
+            <button type="submit" className="w-full bg-black text-white p-3 rounded-xl">
               Fahrt anmelden
             </button>
           </form>
-        ) : (
-          <div className="space-y-3">
-            <p className="text-xl font-semibold">Du bist angemeldet ✅</p>
+        </div>
 
-            <p>
-              Deine Fahrt: <strong>{result.rideNumber}</strong>
-            </p>
+        <div className="border-t pt-6">
+          <h2 className="text-xl font-bold mb-3">Fahrt suchen</h2>
 
-            <p>
-              Personen in dieser Fahrt: <strong>{result.totalSeats}</strong> /{" "}
-              {MAX_SEATS_PER_RIDE}
-            </p>
+          <form onSubmit={searchRide} className="space-y-3">
+            <input
+              type="text"
+              placeholder="Fahrtnummer, z.B. Fahrt-010"
+              className="w-full border p-3 rounded-xl text-black"
+              value={searchRideNumber}
+              onChange={(e) => setSearchRideNumber(e.target.value)}
+            />
 
-            <p>
-              Fahrzeit einfach: ca. <strong>{result.oneWayMinutes} Minuten</strong>
-            </p>
+            <input
+              type="text"
+              placeholder="Dein Name für Stornierung"
+              className="w-full border p-3 rounded-xl text-black"
+              value={searchName}
+              onChange={(e) => setSearchName(e.target.value)}
+            />
 
-            <p>
-              Geschätzte Wartezeit: ca.{" "}
-              <strong>{result.estimatedWaitingMinutes} Minuten</strong>
-            </p>
-          </div>
-        )}
+            <button className="w-full bg-gray-800 text-white p-3 rounded-xl">
+              Fahrt suchen
+            </button>
+          </form>
+        </div>
       </div>
     </main>
   );
