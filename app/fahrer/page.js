@@ -10,7 +10,7 @@ import {
   updateDoc,
   setDoc,
 } from "firebase/firestore";
-import { GoogleMap, Marker, LoadScript } from "@react-google-maps/api";
+import { GoogleMap, Marker, useJsApiLoader } from "@react-google-maps/api";
 import { db } from "@/lib/firebase";
 
 const GOOGLE_MAPS_API_KEY = "AIzaSyCb7QdIbcoMXKlB7eA-ZKFhuubJzbyF0Fs";
@@ -21,6 +21,8 @@ const PARTY_LOCATION = {
   lng: 8.2378,
   address: "Klostergut Fremersberg, 76530 Baden-Baden",
 };
+
+const MAX_SEATS_PER_RIDE = 4;
 
 const mapContainerStyle = {
   width: "100%",
@@ -33,11 +35,21 @@ function getGuests(ride) {
   return [];
 }
 
+function getTotalSeats(ride) {
+  const guests = getGuests(ride);
+  return guests.reduce((total, guest) => total + (guest.personCount || 1), 0);
+}
+
 export default function FahrerPage() {
   const [driverName, setDriverName] = useState("");
   const [savedDriverName, setSavedDriverName] = useState("");
   const [rides, setRides] = useState([]);
   const [driverLocation, setDriverLocation] = useState(null);
+
+  const { isLoaded } = useJsApiLoader({
+    googleMapsApiKey: GOOGLE_MAPS_API_KEY,
+    libraries,
+  });
 
   useEffect(() => {
     const q = query(collection(db, "rides"), orderBy("createdAt", "asc"));
@@ -110,7 +122,9 @@ export default function FahrerPage() {
       completedAt: Date.now(),
     });
 
-    const nextOpenRide = rides.find((ride) => ride.status === "open");
+    const nextOpenRide = rides.find(
+      (ride) => ride.status === "open" && getTotalSeats(ride) > 0
+    );
 
     if (nextOpenRide) {
       await updateDoc(doc(db, "rides", nextOpenRide.id), {
@@ -130,14 +144,23 @@ export default function FahrerPage() {
   const currentRide = rides.find(
     (ride) =>
       ride.status === "assigned" &&
-      ride.assignedDriver === savedDriverName
+      ride.assignedDriver === savedDriverName &&
+      getTotalSeats(ride) > 0
   );
 
-  const openRides = rides.filter((ride) => ride.status === "open");
+  const openRides = rides.filter(
+    (ride) => ride.status === "open" && getTotalSeats(ride) > 0
+  );
+
   const doneRides = rides.filter((ride) => ride.status === "done");
 
   const guestMarkers = rides
-    .filter((ride) => ride.status !== "done")
+    .filter(
+      (ride) =>
+        ride.status !== "done" &&
+        ride.status !== "cancelled" &&
+        getTotalSeats(ride) > 0
+    )
     .flatMap((ride) =>
       getGuests(ride)
         .filter((guest) => guest.location)
@@ -148,6 +171,14 @@ export default function FahrerPage() {
           location: guest.location,
         }))
     );
+
+  if (!isLoaded) {
+    return (
+      <main className="min-h-screen flex items-center justify-center text-black">
+        Lade Google Maps...
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen bg-gray-100 p-6 text-black">
@@ -192,30 +223,25 @@ export default function FahrerPage() {
             <div className="bg-white rounded-2xl shadow p-6">
               <h2 className="text-2xl font-bold mb-4">Live-Karte</h2>
 
-              <LoadScript
-                googleMapsApiKey={GOOGLE_MAPS_API_KEY}
-                libraries={libraries}
+              <GoogleMap
+                mapContainerStyle={mapContainerStyle}
+                center={driverLocation || PARTY_LOCATION}
+                zoom={13}
               >
-                <GoogleMap
-                  mapContainerStyle={mapContainerStyle}
-                  center={driverLocation || PARTY_LOCATION}
-                  zoom={13}
-                >
-                  <Marker position={PARTY_LOCATION} label="Fest" />
+                <Marker position={PARTY_LOCATION} label="Fest" />
 
-                  {driverLocation && (
-                    <Marker position={driverLocation} label="Ich" />
-                  )}
+                {driverLocation && (
+                  <Marker position={driverLocation} label="Ich" />
+                )}
 
-                  {guestMarkers.map((guest) => (
-                    <Marker
-                      key={guest.id}
-                      position={guest.location}
-                      label={guest.rideNumber}
-                    />
-                  ))}
-                </GoogleMap>
-              </LoadScript>
+                {guestMarkers.map((guest) => (
+                  <Marker
+                    key={guest.id}
+                    position={guest.location}
+                    label={guest.rideNumber}
+                  />
+                ))}
+              </GoogleMap>
             </div>
 
             <div className="bg-white rounded-2xl shadow p-6">
@@ -228,15 +254,26 @@ export default function FahrerPage() {
                   </p>
 
                   <p>
-                    Personen: <strong>{getGuests(currentRide).length}</strong>
+                    Personen:{" "}
+                    <strong>
+                      {currentRide.totalSeats || getTotalSeats(currentRide)}
+                    </strong>{" "}
+                    / {MAX_SEATS_PER_RIDE}
                   </p>
 
                   <div className="space-y-2">
                     {getGuests(currentRide).map((guest, index) => (
-                      <div key={index} className="border rounded-xl p-3">
+                      <div key={guest.id || index} className="border rounded-xl p-3">
                         <p>
-                          <strong>{index + 1}. {guest.name}</strong>
+                          <strong>
+                            {index + 1}. {guest.name}
+                          </strong>
                         </p>
+
+                        <p>
+                          Personen: <strong>{guest.personCount || 1}</strong>
+                        </p>
+
                         <p>{guest.address}</p>
 
                         <button
@@ -280,13 +317,16 @@ export default function FahrerPage() {
                       </p>
 
                       <p>
-                        Personen: <strong>{getGuests(ride).length}</strong>
+                        Personen:{" "}
+                        <strong>{ride.totalSeats || getTotalSeats(ride)}</strong>{" "}
+                        / {MAX_SEATS_PER_RIDE}
                       </p>
 
                       <div className="mt-2 space-y-1">
                         {getGuests(ride).map((guest, index) => (
-                          <p key={index}>
-                            {index + 1}. {guest.name} — {guest.address}
+                          <p key={guest.id || index}>
+                            {index + 1}. {guest.name} ({guest.personCount || 1}{" "}
+                            Pers.) — {guest.address}
                           </p>
                         ))}
                       </div>
@@ -318,7 +358,9 @@ export default function FahrerPage() {
                   {doneRides.map((ride) => (
                     <div key={ride.id} className="border rounded-xl p-3">
                       <strong>{ride.rideNumber}</strong> —{" "}
-                      {getGuests(ride).map((guest) => guest.name).join(", ")}
+                      {getGuests(ride)
+                        .map((guest) => `${guest.name} (${guest.personCount || 1})`)
+                        .join(", ")}
                     </div>
                   ))}
                 </div>
